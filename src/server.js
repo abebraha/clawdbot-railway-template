@@ -1333,8 +1333,8 @@ proxy.on("error", (err, _req, res) => {
 // not just the /setup routes.  Healthcheck is excluded so Railway probes work.
 function requireDashboardAuth(req, res, next) {
   if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
+  if (!req.path.startsWith("/setup")) return next();
   if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
-  if (/\.(js|mjs|css|map|woff2?|ttf|svg|png|ico|webp)$/.test(req.path)) return next();
   if (!SETUP_PASSWORD) return next(); // no password configured → open
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
@@ -1363,7 +1363,6 @@ function attachGatewayAuthHeader(req) {
 }
 
 proxy.on("proxyReqWs", (_proxyReq, req) => {
-  attachGatewayAuthHeader(req);
 });
 
 app.use(requireDashboardAuth, async (req, res) => {
@@ -1388,7 +1387,6 @@ app.use(requireDashboardAuth, async (req, res) => {
     }
   }
 
-  attachGatewayAuthHeader(req);
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1475,7 +1473,6 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
-  attachGatewayAuthHeader(req);
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
