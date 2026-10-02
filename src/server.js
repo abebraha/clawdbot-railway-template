@@ -271,6 +271,32 @@ async function restartGateway() {
   return ensureGatewayRunning();
 }
 
+// After a redeploy, the new gateway can't start until the old one's lease on the state
+// directory is released or expires (up to 5 minutes after the old container was killed).
+// Keep retrying in the background meanwhile, instead of waiting for a request to retry.
+const GATEWAY_BOOT_RETRY_MS = 15_000;
+const GATEWAY_BOOT_RETRY_WINDOW_MS = 6 * 60_000;
+
+async function startGatewayAtBoot() {
+  const deadline = Date.now() + GATEWAY_BOOT_RETRY_WINDOW_MS;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await ensureGatewayRunning();
+      console.log("[wrapper] gateway ready");
+      return;
+    } catch (err) {
+      if (Date.now() + GATEWAY_BOOT_RETRY_MS > deadline) {
+        console.error(`[wrapper] gateway failed to start at boot: ${String(err)}`);
+        return;
+      }
+      console.warn(
+        `[wrapper] gateway not up yet (attempt ${attempt}): ${String(err)}; retrying in ${GATEWAY_BOOT_RETRY_MS / 1000}s`,
+      );
+      await sleep(GATEWAY_BOOT_RETRY_MS);
+    }
+  }
+}
+
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
     return res
@@ -1449,12 +1475,7 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   // work even if nobody visits the web UI.
   if (isConfigured()) {
     console.log("[wrapper] config detected; starting gateway...");
-    try {
-      await ensureGatewayRunning();
-      console.log("[wrapper] gateway ready");
-    } catch (err) {
-      console.error(`[wrapper] gateway failed to start at boot: ${String(err)}`);
-    }
+    await startGatewayAtBoot();
   }
 });
 
@@ -1476,20 +1497,33 @@ server.on("upgrade", async (req, socket, head) => {
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
+// Railway sends SIGTERM, then SIGKILL once the service's draining time (30s) is up.
+// A gateway that exits cleanly releases its lease on the state directory; one killed
+// along with the container leaves it behind, and the next deploy's gateway can't start
+// until it expires (up to 5 minutes). So wait for the gateway to exit before exiting.
+const GATEWAY_STOP_WAIT_MS = 25_000;
+
 process.on("SIGTERM", () => {
   // Best-effort shutdown
+  const proc = gatewayProc;
+  const gatewayExited = proc ? new Promise((resolve) => proc.once("exit", resolve)) : null;
   try {
-    if (gatewayProc) gatewayProc.kill("SIGTERM");
+    if (proc) proc.kill("SIGTERM");
   } catch {
     // ignore
   }
 
   // Stop accepting new connections; allow in-flight requests to complete briefly.
-  try {
-    server.close(() => process.exit(0));
-  } catch {
-    process.exit(0);
-  }
+  const serverClosed = new Promise((resolve) => {
+    try {
+      server.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
 
-  setTimeout(() => process.exit(0), 5_000).unref?.();
+  Promise.all([
+    Promise.race([serverClosed, sleep(5_000)]),
+    gatewayExited && Promise.race([gatewayExited, sleep(GATEWAY_STOP_WAIT_MS)]),
+  ]).finally(() => process.exit(0));
 });
